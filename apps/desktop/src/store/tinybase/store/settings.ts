@@ -1,4 +1,5 @@
 import { disable, enable } from "@tauri-apps/plugin-autostart";
+import { isTauri } from "@tauri-apps/api/core";
 import { useEffect } from "react";
 import { createBroadcastChannelSynchronizer } from "tinybase/synchronizers/synchronizer-broadcast-channel/with-schemas";
 import * as _UI from "tinybase/ui-react/with-schemas";
@@ -280,6 +281,9 @@ type SettingsListeners = {
 
 const SETTINGS_LISTENERS: SettingsListeners = {
   autostart: (_store, newValue) => {
+    if (!isTauri()) {
+      return;
+    }
     if (newValue) {
       enable().catch(console.error);
     } else {

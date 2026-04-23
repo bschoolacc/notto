@@ -1,4 +1,5 @@
 import { type UnlistenFn } from "@tauri-apps/api/event";
+import { isTauri } from "@tauri-apps/api/core";
 import { useEffect, useRef } from "react";
 
 import { events as notificationEvents } from "@hypr/plugin-notification";
@@ -37,6 +38,10 @@ function useUpdaterEvents() {
   const openNew = useTabs((state) => state.openNew);
 
   useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
     if (getCurrentWebviewWindowLabel() !== "main") {
       return;
     }
@@ -92,6 +97,10 @@ function useNotificationEvents() {
   }, [store, openNew]);
 
   useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
     if (getCurrentWebviewWindowLabel() !== "main") {
       return;
     }

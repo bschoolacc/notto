@@ -16,6 +16,7 @@ import {
   getCurrentWebviewWindowLabel,
   init as initWindowsPlugin,
 } from "@hypr/plugin-windows";
+import { isTauri } from "@tauri-apps/api/core";
 import { Toaster } from "@hypr/ui/components/ui/toast";
 import "@hypr/ui/globals.css";
 
@@ -103,7 +104,7 @@ function AppWithTiny() {
   const manager = useCreateManager(() => {
     return createManager().start();
   });
-  const isMainWindow = getCurrentWebviewWindowLabel() === "main";
+  const isMainWindow = !isTauri() || getCurrentWebviewWindowLabel() === "main";
 
   return (
     <QueryClientProvider client={queryClient}>
