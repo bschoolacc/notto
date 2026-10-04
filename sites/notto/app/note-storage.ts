@@ -5,6 +5,7 @@ export type Summary = {
   start: number; end: number; source: string; createdAt: number;
   provider?: string; model?: string; generationTimeMs?: number;
   regeneratedFrom?: string; usedMultiStage?: boolean;
+  fallbackFrom?: string[];
 };
 export type Note = {
   id: string; title: string; createdAt: number; updatedAt: number;
@@ -25,7 +26,7 @@ export function parseNotes(raw: string): Note[] {
     && seconds(note.createdAt) && seconds(note.updatedAt) && seconds(note.summarizedThrough)
     && Array.isArray(note.chunks) && note.chunks.every((chunk) => object(chunk) && typeof chunk.id === "string" && typeof chunk.text === "string" && range(chunk))
     && Array.isArray(note.typedNotes) && note.typedNotes.every((item) => object(item) && typeof item.id === "string" && typeof item.text === "string" && seconds(item.time))
-    && Array.isArray(note.summaries) && note.summaries.every((item) => object(item) && typeof item.id === "string" && typeof item.source === "string" && ["quick", "concise", "study", "actions"].includes(String(item.kind)) && range(item) && seconds(item.createdAt))
+    && Array.isArray(note.summaries) && note.summaries.every((item) => object(item) && typeof item.id === "string" && typeof item.source === "string" && ["quick", "concise", "study", "actions"].includes(String(item.kind)) && range(item) && seconds(item.createdAt) && (item.fallbackFrom === undefined || Array.isArray(item.fallbackFrom) && item.fallbackFrom.length <= 2 && item.fallbackFrom.every((model) => typeof model === "string")))
     && (note.titleMode === undefined || note.titleMode === "auto" || note.titleMode === "manual")
     && (note.pinned === undefined || typeof note.pinned === "boolean")
     && (note.draftText === undefined || typeof note.draftText === "string")

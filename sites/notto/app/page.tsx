@@ -11,9 +11,11 @@ import { notebookStorageKey } from "./browser-keys";
 import type { qaFixtures } from "./qa-fixtures";
 import { NotebookDashboard } from "./notebook-dashboard";
 import { THEMES, LANGUAGES, DEFAULT_PREFERENCES, parsePreferences, autoNameNote, suggestedTitle, classifyImport, type Preferences } from "./preferences";
-import { transcribeAudio, transcriptionPrompt, type TranscriptSegment } from "./transcription";
+import { transcribeAudio, transcriptionRequestPreview, type TranscriptSegment } from "./transcription";
 import { buildGenerationPrompt } from "./ai";
 import { formatTime, rangeLabel } from "./time";
+import { defaultModel, modelCandidates, parseModelPreferences, taskForSnapshot, withModelFallback, type ModelSelection } from "./model-policy";
+import { ModelSettings } from "./model-settings";
 
 type SpeechResult = { isFinal: boolean; 0: { transcript: string } };
 type SpeechResultEvent = { resultIndex: number; results: ArrayLike<SpeechResult> };
@@ -95,8 +97,9 @@ export default function Home() {
   const [importing, setImporting] = useState(false);
   const [serviceCheck, setServiceCheck] = useState("");
   const [transcribing, setTranscribing] = useState(false);
+  const [transcriptionProgress, setTranscriptionProgress] = useState("");
   const [transcriptError, setTranscriptError] = useState("");
-  const [transcriptDraft, setTranscriptDraft] = useState<{ noteId: string; sessionId: string; offset: number; segments: TranscriptSegment[] } | null>(null);
+  const [transcriptDraft, setTranscriptDraft] = useState<{ noteId: string; sessionId: string; offset: number; segments: TranscriptSegment[]; model: string; fallback: boolean } | null>(null);
   const transcriptDraftRef = useRef(false);
   const transcriptionControllerRef = useRef<AbortController | null>(null);
   const [dark, setDark] = useState(false);
@@ -112,6 +115,8 @@ export default function Home() {
   const [saveApiKey, setSaveApiKey] = useState(false);
   const [models, setModels] = useState<ProviderModel[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
+  const [modelSelection, setModelSelection] = useState<ModelSelection>("recommended");
+  const [autoFallback, setAutoFallback] = useState(true);
   const [aiStatus, setAiStatus] = useState<{ state: "unconfigured" | "checking" | "connected" | "error"; message: string }>({ state: "unconfigured", message: "Add a Gemini API key to enable AI notes." });
   const [generation, setGeneration] = useState<{ mode: GenerationMode; label: string } | null>(null);
   const [generationError, setGenerationError] = useState("");
@@ -233,14 +238,16 @@ export default function Home() {
     const savedAI = readSetting(AI_SETTINGS_KEY);
     if (savedAI) {
       try {
-        const parsed = JSON.parse(savedAI) as { saveKey?: boolean; selectedModel?: string };
+        const parsed = parseModelPreferences(savedAI);
         setSaveApiKey(Boolean(parsed.saveKey));
-        setSelectedModel(typeof parsed.selectedModel === "string" ? parsed.selectedModel : "");
+        setSelectedModel(parsed.selectedModel);
+        setModelSelection(parsed.modelSelection);
+        setAutoFallback(parsed.autoFallback);
         if (parsed.saveKey) setApiKey(readSetting(AI_KEY_STORAGE) ?? "");
       } catch { /* keep AI unconfigured */ }
     }
     if (process.env.NODE_ENV === "development" && qaRef.current) {
-      setApiKey("qa-key"); if (!savedAI) setSelectedModel("qa-gemini-fixture");
+      setApiKey("qa-key");
     }
     setMounted(true);
     };
@@ -385,11 +392,11 @@ export default function Home() {
   useEffect(() => {
     if (!mounted) return;
     try {
-      localStorage.setItem(notebookStorageKey(AI_SETTINGS_KEY), JSON.stringify({ provider: "gemini", saveKey: saveApiKey, selectedModel }));
+      localStorage.setItem(notebookStorageKey(AI_SETTINGS_KEY), JSON.stringify({ provider: "gemini", saveKey: saveApiKey, selectedModel, modelSelection, autoFallback }));
       if (saveApiKey && apiKey.trim()) localStorage.setItem(notebookStorageKey(AI_KEY_STORAGE), apiKey.trim());
       else localStorage.removeItem(notebookStorageKey(AI_KEY_STORAGE));
     } catch { showNotice("AI preferences could not be saved. The key remains available in this tab."); }
-  }, [apiKey, mounted, saveApiKey, selectedModel]);
+  }, [apiKey, mounted, saveApiKey, selectedModel, modelSelection, autoFallback]);
 
   useEffect(() => {
     disposedRef.current = false;
@@ -702,19 +709,25 @@ export default function Home() {
 
   const runTranscription = async () => {
     if (transcriptionControllerRef.current || recordingBusy || transcriptDraft || !selectedAudio || active.deletedAt) return;
-    const model = models.find((item) => item.name === selectedModel);
-    if (aiStatus.state !== "connected" || !model) { setSettingsSection("ai"); setSettingsOpen(true); return; }
+    const candidates = modelCandidates(models, "audio", { modelSelection, selectedModel, autoFallback, transcriptionInstructions: preferences.transcriptionInstructions });
+    if (aiStatus.state !== "connected" || !candidates.length) {
+      setTranscriptError(aiStatus.state === "connected" ? "This manual model is not supported for audio transcription. Choose Recommended or an audio-compatible Gemini model in AI settings." : "Connect Gemini in AI settings to transcribe saved audio.");
+      setSettingsSection("ai"); setSettingsOpen(true); return;
+    }
     const session = selectedAudio;
     const noteId = activeId;
     const duration = Number.isFinite(audioRef.current?.duration) ? audioRef.current!.duration : session.duration;
     const controller = new AbortController(); transcriptionControllerRef.current = controller;
-    setTranscribing(true); setTranscriptError("");
+    setTranscribing(true); setTranscriptError(""); setTranscriptionProgress("Loading saved audio…");
     try {
       const audio = fallbackAudioRef.current[session.id] ?? await readAudioSession(session, notebookStorageKey("notto-audio-v1"));
-      const segments = qaRef.current ? await qaRef.current.transcribe(apiKey, controller.signal) : await transcribeAudio(apiKey, model, audio, preferences.transcriptionInstructions, settings.language, duration, controller.signal);
+      const result = await withModelFallback(candidates, (model) => qaRef.current ? qaRef.current.transcribe(apiKey, controller.signal) : transcribeAudio(apiKey, model, audio, preferences.transcriptionInstructions, settings.language, duration, controller.signal), controller.signal, (model, attempt, reason) => {
+        setTranscriptionProgress(`${attempt ? `Fallback ${attempt}: ${reason}. ` : ""}${model.displayName} is transcribing…`);
+      });
+      const segments = result.value;
       if (controller.signal.aborted) throw new Error("Transcription cancelled. No text was added.");
       if (!segments.length) { showNotice("No speech was detected. Existing text was kept."); return; }
-      setTranscriptDraft({ noteId, sessionId: session.id, offset: session.offset ?? 0, segments });
+      setTranscriptDraft({ noteId, sessionId: session.id, offset: session.offset ?? 0, segments, model: result.model.name, fallback: result.attemptedModels.length > 1 });
       setActiveId(noteId); setDashboard(false); setTab("transcript");
       showNotice("Transcript ready to review. Nothing has been added yet.");
     } catch (error) { setTranscriptError(controller.signal.aborted ? "Transcription cancelled. No text was added." : error instanceof Error ? error.message : "Transcription failed. No text was added."); }
@@ -743,13 +756,13 @@ export default function Home() {
     try {
       const available = await (qaRef.current?.provider ?? geminiProvider).listModels(apiKey, controller.signal);
       if (controller.signal.aborted || modelControllerRef.current !== controller) return;
-      if (!available.length) throw new ProviderError("unavailable_model", "No suitable Gemini text-generation models are available to this key.");
+      if (!available.length) throw new ProviderError("unavailable_model", "No compatible note or saved-audio transcription models are available to this key.");
       setModels(available);
       const savedStillExists = available.some((model) => model.name === selectedModel);
-      const next = savedStillExists ? selectedModel : available[0].name;
+      const next = modelSelection === "manual" && savedStillExists ? selectedModel : defaultModel(available)?.name ?? "";
       setSelectedModel(next);
-      const switched = Boolean(selectedModel) && !savedStillExists;
-      setAiStatus({ state: "connected", message: switched ? `Connected. ${selectedModel} disappeared, so Notto selected ${next}.` : `Connected to Gemini. ${countLabel(available.length, "suitable text model")} found.` });
+      const switched = modelSelection === "manual" && Boolean(selectedModel) && !savedStillExists;
+      setAiStatus({ state: "connected", message: switched ? `Connected. ${selectedModel} disappeared, so Notto selected ${next || "Recommended"}.` : `Connected to Google. ${countLabel(available.length, "compatible AI model")} found.` });
       if (announce) showNotice(switched ? `Model changed to ${next}` : "Gemini connection verified");
     } catch (error) {
       if (controller.signal.aborted || modelControllerRef.current !== controller) return;
@@ -761,10 +774,10 @@ export default function Home() {
 
   const runGeneration = async (snapshot: SourceSnapshot, regeneratedFrom?: string) => {
     if (generationControllerRef.current) return;
-    const model = models.find((item) => item.name === selectedModel);
-    if (!apiKey.trim() || aiStatus.state !== "connected" || !model) {
+    const candidates = modelCandidates(models, taskForSnapshot(snapshot), { modelSelection, selectedModel, autoFallback });
+    if (!apiKey.trim() || aiStatus.state !== "connected" || !candidates.length) {
       setSettingsSection("ai"); setSettingsOpen(true);
-      setAiStatus((current) => ({ state: current.state === "connected" ? "error" : current.state, message: "Add and test a Gemini API key, then select a model before generating notes." }));
+      setAiStatus((current) => ({ ...current, message: current.state === "connected" ? "No compatible model is selected for this source. Choose a model manually or refresh models." : "Add and test a Gemini API key, then select a model before generating notes." }));
       return;
     }
     const noteId = snapshot.noteId;
@@ -778,12 +791,18 @@ export default function Home() {
     setSummaryMenu(false);
     const started = Date.now();
     try {
-      const result = await (qaRef.current?.provider ?? geminiProvider).generate(apiKey, model, snapshot, controller.signal, (label) => { if (!controller.signal.aborted) setGeneration({ mode: snapshot.mode, label }); });
+      let modelLabel = "";
+      const completed = await withModelFallback(candidates, (model) => (qaRef.current?.provider ?? geminiProvider).generate(apiKey, model, snapshot, controller.signal, (label) => { if (!controller.signal.aborted) setGeneration({ mode: snapshot.mode, label: `${modelLabel} · ${label}` }); }), controller.signal, (model, attempt, reason) => {
+        modelLabel = `${attempt ? `Fallback ${attempt} (${reason}): ` : ""}${model.displayName}`;
+        setGeneration({ mode: snapshot.mode, label: `${modelLabel} · Starting…` });
+      });
+      const result = completed.value;
       if (controller.signal.aborted) throw new ProviderError("cancelled", "Generation was cancelled. The source range is ready to retry.");
       setSaveState("saving");
       const summary: Summary = {
         id: uid(), kind: snapshot.mode, start: snapshot.start, end: snapshot.end, source: result.source,
-        createdAt: Date.now(), provider: "Google Gemini", model: model.name, generationTimeMs: Date.now() - started,
+        createdAt: Date.now(), provider: "Google Gemini API", model: completed.model.name, generationTimeMs: Date.now() - started,
+        fallbackFrom: completed.attemptedModels.slice(0, -1),
         regeneratedFrom, usedMultiStage: result.usedMultiStage,
       };
       setNotes((all) => all.map((note) => note.id === noteId ? {
@@ -794,7 +813,7 @@ export default function Home() {
         updatedAt: Date.now(),
       } : note));
       setPendingSource(null);
-      showNotice(result.usedMultiStage ? "Gemini generated notes through a complete multi-stage synthesis" : snapshot.mode === "study" ? "Gemini study guide saved" : snapshot.mode === "concise" ? "Gemini concise notes saved" : "Gemini Catch Me Up saved");
+      showNotice(`${snapshot.mode === "study" ? "Study guide" : snapshot.mode === "concise" ? "Basic notes" : "Catch Me Up"} saved with ${completed.model.displayName}${completed.attemptedModels.length > 1 ? " (fallback)" : ""}${result.usedMultiStage ? " · complete multi-stage synthesis" : ""}`);
     } catch (error) {
       const message = error instanceof ProviderError ? error.message : "Gemini could not generate these notes. The source range is ready to retry.";
       setGenerationError(message);
@@ -1074,7 +1093,7 @@ export default function Home() {
           <div className="breadcrumbs"><button disabled={recordingBusy} onClick={() => { setDashboard(true); setShowTrash(false); }}>My notes</button>{!dashboard && <><b>/</b><strong>{active.title}</strong></>}</div>
           <div className="top-actions">
             <label className={`import-button ${recordingBusy ? "disabled" : ""}`}><Icon name="upload" size={16}/> Import audio<input type="file" accept="audio/*" aria-label="Import audio" disabled={recordingBusy} onChange={(e) => { if (e.target.files?.[0]) void handleFileImport(e.target.files[0]); e.target.value = ""; }} /></label>
-            {!dashboard && <button aria-label="Catch me up" className="catch-up" disabled={aiStatus.state !== "connected" || Boolean(generation)} title={aiStatus.state === "connected" ? `Generate with ${selectedModel}` : "Connect Gemini in Settings"} onClick={() => generateSummary("quick")}><Icon name="sparkle" size={16}/> {generation?.mode === "quick" ? "Generating…" : "Catch me up"}</button>}
+            {!dashboard && <button aria-label="Catch me up" className="catch-up" disabled={aiStatus.state !== "connected" || Boolean(generation)} title={aiStatus.state === "connected" ? modelSelection === "recommended" ? "Use the recommended model for this source" : `Generate with ${selectedModel}` : "Connect Gemini in Settings"} onClick={() => generateSummary("quick")}><Icon name="sparkle" size={16}/> {generation?.mode === "quick" ? "Generating…" : "Catch me up"}</button>}
             {!dashboard && <div className="note-actions"><button className="note-menu-trigger" aria-label="Note actions" aria-expanded={noteMenu} aria-controls="note-actions-menu" onClick={() => setNoteMenu((value) => !value)}>•••</button>{noteMenu && <div className="summary-menu note-menu" id="note-actions-menu"><button onClick={() => { updateActive((note) => ({ ...note, title: suggestedTitle(note), titleMode: "auto" })); setNoteMenu(false); showNotice("Title generated from this note"); }}><strong>Auto-name from content</strong><small>Suggest a title without sending data</small></button><button onClick={() => { setNoteMenu(false); titleRef.current?.focus(); }}><strong>Rename manually</strong><small>Choose your own title</small></button><button disabled={recordingBusy} onClick={copyNote}><strong>Duplicate note</strong><small>Copy text, notes, and summaries</small></button><button disabled={recordingBusy || Boolean(generation)} onClick={active.deletedAt ? () => restoreNote(active.id) : () => trashNote()}><strong>{active.deletedAt ? "Restore note" : "Move to Trash"}</strong><small>Your note and audio can be restored</small></button></div>}</div>}
           </div>
         </header>
@@ -1100,9 +1119,9 @@ export default function Home() {
               <section className="transcript-section">
                 <div className="section-heading"><div><h2>Transcript</h2><p>Capture speech or paste text, then edit any section</p></div><div className="transcript-tools"><button disabled={recordingBusy || Boolean(active.deletedAt)} onClick={addTranscriptChunk}><Icon name="plus" size={14}/> Add chunk</button><span className="language-pill">{LANGUAGES[settings.language as keyof typeof LANGUAGES]}</span></div></div>
                 {transcriptError && <div className="audio-error" role="alert">{transcriptError}<button className="secondary-action" onClick={() => setTranscriptError("")}>Dismiss</button></div>}
-                {transcriptDraft?.noteId === active.id && <section className="transcription-review"><div><h3>Review your transcript</h3><p>{countLabel(transcriptDraft.segments.length, "segment")} · appending keeps your existing text</p></div><div className="transcription-review-text">{transcriptDraft.segments.map((segment, index) => <label key={index}><time>{rangeLabel(segment.start + transcriptDraft.offset, segment.end + transcriptDraft.offset)}</time><textarea aria-label={`Transcription draft segment ${index + 1}`} value={segment.text} onChange={(event) => setTranscriptDraft((current) => current ? { ...current, segments: current.segments.map((item, i) => i === index ? { ...item, text: event.target.value } : item) } : null)}/></label>)}</div><div className="ai-button-row"><button className="summary-button" disabled={Boolean(active.deletedAt) || !transcriptDraft.segments.some((item) => item.text.trim())} onClick={() => { const draft = transcriptDraft; updateActive((note) => ({ ...note, chunks: [...note.chunks, ...draft.segments.filter((item) => item.text.trim()).map((item) => ({ ...item, id: uid(), start: item.start + draft.offset, end: item.end + draft.offset }))].sort((a, b) => a.start - b.start) }), true); setTranscriptDraft(null); showNotice("Reviewed transcript added. Existing text was kept."); }}>Add to transcript</button><button className="secondary-action" onClick={() => setTranscriptDraft(null)}>Discard draft</button></div></section>}
+                {transcriptDraft?.noteId === active.id && <section className="transcription-review"><div><h3>Review your transcript</h3><p>{countLabel(transcriptDraft.segments.length, "segment")} · {transcriptDraft.model}{transcriptDraft.fallback ? " · fallback used" : ""} · appending keeps your existing text</p></div><div className="transcription-review-text">{transcriptDraft.segments.map((segment, index) => <label key={index}><time>{rangeLabel(segment.start + transcriptDraft.offset, segment.end + transcriptDraft.offset)}</time><textarea aria-label={`Transcription draft segment ${index + 1}`} value={segment.text} onChange={(event) => setTranscriptDraft((current) => current ? { ...current, segments: current.segments.map((item, i) => i === index ? { ...item, text: event.target.value } : item) } : null)}/></label>)}</div><div className="ai-button-row"><button className="summary-button" disabled={Boolean(active.deletedAt) || !transcriptDraft.segments.some((item) => item.text.trim())} onClick={() => { const draft = transcriptDraft; updateActive((note) => ({ ...note, chunks: [...note.chunks, ...draft.segments.filter((item) => item.text.trim()).map((item) => ({ ...item, id: uid(), start: item.start + draft.offset, end: item.end + draft.offset }))].sort((a, b) => a.start - b.start) }), true); setTranscriptDraft(null); showNotice("Reviewed transcript added. Existing text was kept."); }}>Add to transcript</button><button className="secondary-action" onClick={() => setTranscriptDraft(null)}>Discard draft</button></div></section>}
                 {audioError && <div className="audio-error" role="alert">{audioError}</div>}
-                {audioSessions.length > 0 && !recordingBusy && <div className="transcribe-controls"><div><strong>Transcribe saved audio</strong><p>Send this session to Gemini · up to 12 MB and 20 minutes · review before adding</p></div>{transcribing ? <button className="secondary-action" onClick={() => transcriptionControllerRef.current?.abort()}>Cancel transcription</button> : <button className="secondary-action" disabled={recordingBusy || audioLoading || !selectedAudioId || Boolean(transcriptDraft) || Boolean(active.deletedAt)} onClick={() => void runTranscription()}>{aiStatus.state === "connected" ? "Transcribe with Gemini" : "Connect Gemini"}</button>}{transcribing && <p role="status"><span className="spinner"/> Gemini is transcribing…</p>}</div>}
+                {audioSessions.length > 0 && !recordingBusy && <div className="transcribe-controls"><div><strong>Transcribe saved audio</strong><p>Send this session to Gemini · up to 12 MB and 20 minutes · review before adding</p></div>{transcribing ? <button className="secondary-action" onClick={() => transcriptionControllerRef.current?.abort()}>Cancel transcription</button> : <button className="secondary-action" disabled={recordingBusy || audioLoading || !selectedAudioId || Boolean(transcriptDraft) || Boolean(active.deletedAt)} onClick={() => void runTranscription()}>{aiStatus.state === "connected" ? "Transcribe with Gemini" : "Connect Gemini"}</button>}{transcribing && <p role="status"><span className="spinner"/> {transcriptionProgress}</p>}</div>}
                 {audioSessions.length > 0 && <div className="audio-import-panel"><div className="audio-session-heading"><Icon name="mic" size={18}/><span><strong>Audio sessions</strong><small>{audioSessions.length} {audioSessions.length === 1 ? "session" : "sessions"} · {ephemeralAudioIds.includes(selectedAudioId) ? "download before leaving" : selectedAudio?.status === "interrupted" ? "interrupted session recovered" : "saved on this device"}</small></span></div><select aria-label="Audio session" value={selectedAudioId} onChange={(event) => { setSelectedAudioId(event.target.value); setAudioError(""); }}>{audioSessions.map((session) => <option key={session.id} value={session.id}>{session.name} · {new Date(session.createdAt).toLocaleString()}</option>)}</select>{audioLoading ? <p role="status">Opening audio…</p> : audioURL && <audio ref={audioRef} aria-label="Recorded audio" controls preload="metadata" src={audioURL} onLoadedMetadata={() => { if (audioRef.current) audioRef.current.playbackRate = playbackSpeed; }} onError={() => setAudioError("This browser could not play the selected audio. Download the file or try another browser.")}/>}<div className="audio-actions"><label>Speed<select aria-label="Playback speed" value={playbackSpeed} onChange={(event) => { const speed = Number(event.target.value); setPlaybackSpeed(speed); if (audioRef.current) audioRef.current.playbackRate = speed; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>{audioURL && <a href={audioURL} download={`${safeFilename(active.title)}-${selectedAudioId}.${audioExtension(selectedAudio?.mimeType ?? "")}`}>Download audio</a>}</div><p>Imported audio stays separate from your text. Play it while adding or correcting transcript sections.</p></div>}
                 {recordingBusy && <div className="capture-feedback" role="status"><span className="connection-dot"/><span>{recordingState === "paused" ? "Audio is paused. Your notes still save as you type." : recordingState === "stopping" ? "Finishing the audio file…" : recordingState === "recording" && preferences.liveService === "off" ? "Microphone is recording · live transcription is off" : transcriptionState === "listening" ? "Microphone is recording · live transcription is listening" : transcriptionState === "blocked" || transcriptionState === "unavailable" ? "Audio is recording · live transcription is unavailable. You can keep adding typed notes." : "Preparing your recording…"}</span></div>}
                 <div className="transcript-body">
@@ -1113,7 +1132,7 @@ export default function Home() {
                 {typedComposer}
               </section>
             )}
-            {tab !== "transcript" && <WorkspaceTab key={active.id} composer={typedComposer} tab={tab} note={active} updateActive={updateActive} showNotice={showNotice} summaryMenu={summaryMenu} setSummaryMenu={setSummaryMenu} generateSummary={generateSummary} aiReady={aiStatus.state === "connected" && !active.deletedAt} selectedModel={selectedModel} generation={pendingSource?.noteId === active.id ? generation : null} generationError={pendingSource?.noteId === active.id ? generationError : ""} pendingSource={pendingSource?.noteId === active.id ? pendingSource : null} generationBusy={Boolean(generation)} retryGeneration={() => pendingSource && void runGeneration(pendingSource, pendingRegeneratedFrom)} cancelGeneration={() => generationControllerRef.current?.abort()} openAISettings={() => { setSettingsSection("ai"); setSettingsOpen(true); }} />}
+            {tab !== "transcript" && <WorkspaceTab key={active.id} composer={typedComposer} tab={tab} note={active} updateActive={updateActive} showNotice={showNotice} summaryMenu={summaryMenu} setSummaryMenu={setSummaryMenu} generateSummary={generateSummary} aiReady={aiStatus.state === "connected" && !active.deletedAt} selectedModel={modelSelection === "recommended" ? "recommended models, chosen for each task" : selectedModel} generation={pendingSource?.noteId === active.id ? generation : null} generationError={pendingSource?.noteId === active.id ? generationError : ""} pendingSource={pendingSource?.noteId === active.id ? pendingSource : null} generationBusy={Boolean(generation)} retryGeneration={() => pendingSource && void runGeneration(pendingSource, pendingRegeneratedFrom)} cancelGeneration={() => generationControllerRef.current?.abort()} openAISettings={() => { setSettingsSection("ai"); setSettingsOpen(true); }} />}
           </div>
         </div>}
 
@@ -1145,13 +1164,12 @@ export default function Home() {
             <div className="key-field"><input aria-label="Gemini API key" type={showApiKey ? "text" : "password"} autoComplete="off" spellCheck={false} placeholder="Paste your Google AI Studio key" value={apiKey} onChange={(event) => { modelControllerRef.current?.abort(); setApiKey(event.target.value); setAiStatus({ state: "unconfigured", message: event.target.value.trim() ? "Test the connection to enable AI notes." : "Add a Gemini API key to enable AI notes." }); setModels([]); }}/><button type="button" onClick={() => setShowApiKey((value) => !value)}>{showApiKey ? "Hide" : "Show"}</button></div>
             <label className="save-key"><input type="checkbox" checked={saveApiKey} onChange={(event) => setSaveApiKey(event.target.checked)}/><span>Save key on this device</span></label>
             <div className="ai-button-row"><button className="secondary-action" disabled={!apiKey.trim() || aiStatus.state === "checking"} onClick={() => void refreshModels()}>{aiStatus.state === "checking" ? "Testing…" : "Test Connection"}</button><button className="secondary-action" disabled={!apiKey.trim() || aiStatus.state === "checking"} onClick={() => void refreshModels(false)}>Refresh Models</button></div>
-            <label className="field-label" htmlFor="gemini-model">Model</label>
-            <select id="gemini-model" value={selectedModel} disabled={!models.length} onChange={(event) => setSelectedModel(event.target.value)}><option value="">{models.length ? "Choose a model" : "Test connection to load models"}</option>{models.map((model) => <option key={model.name} value={model.name}>{model.displayName}{model.preview ? " — Preview / experimental" : ""}</option>)}</select>
+            <ModelSettings models={models} selectedModel={selectedModel} selection={modelSelection} autoFallback={autoFallback} transcriptionInstructions={preferences.transcriptionInstructions} busy={Boolean(generation) || transcribing || aiStatus.state === "checking"} onSelection={(value) => { setModelSelection(value); if (value === "recommended") setSelectedModel(defaultModel(models)?.name ?? ""); }} onModel={setSelectedModel} onFallback={setAutoFallback}/>
             <div role="status" className={`connection-status ${aiStatus.state}`}><span className="connection-dot"/>{aiStatus.message}</div>
             <div className="ai-button-row"><button className="clear-key" disabled={!apiKey} onClick={() => { modelControllerRef.current?.abort(); setApiKey(""); setModels([]); setSelectedModel(""); setSaveApiKey(false); try { localStorage.removeItem(notebookStorageKey(AI_KEY_STORAGE)); } catch { showNotice("The saved key could not be cleared. Check browser storage permissions."); } setAiStatus({ state: "unconfigured", message: "API key cleared. AI note generation is unavailable." }); }}>Clear API Key</button><a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">Get a Gemini API key ↗</a></div>
             <p className="security-note">Your key is sent directly to Google Gemini. Save it only on a device you trust. Access, usage charges, and limits depend on your Google project.</p>
           </div>
-          <div className="setting-group"><div><strong>AI instructions</strong><p>Set the wording and focus you want. These preferences are included in each new request.</p></div><label className="field-label" htmlFor="summary-instructions">Summary preferences</label><textarea id="summary-instructions" className="prompt-input" maxLength={4000} value={preferences.summaryInstructions} placeholder="Example: Use concise bullet points. Highlight exam topics and define technical terms." onChange={(event) => setPreferences((current) => ({ ...current, summaryInstructions: event.target.value }))}/><label className="field-label" htmlFor="transcription-instructions">Gemini transcription preferences</label><textarea id="transcription-instructions" className="prompt-input" maxLength={4000} value={preferences.transcriptionInstructions} placeholder="Example: The lecturer discusses biology. Preserve terms such as mitochondria and ATP. Keep filler words." onChange={(event) => setPreferences((current) => ({ ...current, transcriptionInstructions: event.target.value }))}/><p>These instructions apply to Gemini saved-audio transcription. Accuracy and timestamp formatting rules stay in place.</p><details className="prompt-details"><summary>View exact transcription prompt</summary><pre>{transcriptionPrompt(preferences.transcriptionInstructions, settings.language)}</pre></details><details className="prompt-details"><summary>View summary prompt for this note</summary><pre>{buildGenerationPrompt({ noteId: active.id, noteTitle: active.title, mode: "concise", start: 0, end: latestNoteTime(active), chunks: active.chunks, typedNotes: active.typedNotes, instructions: preferences.summaryInstructions })}</pre></details><button className="secondary-action" onClick={() => setPreferences((current) => ({ ...current, summaryInstructions: "", transcriptionInstructions: "" }))}>Reset custom instructions</button></div>
+          <div className="setting-group"><div><strong>AI instructions</strong><p>Set the wording and focus you want. These preferences are included in each new request.</p></div><label className="field-label" htmlFor="summary-instructions">Summary preferences</label><textarea id="summary-instructions" className="prompt-input" maxLength={4000} value={preferences.summaryInstructions} placeholder="Example: Use concise bullet points. Highlight exam topics and define technical terms." onChange={(event) => setPreferences((current) => ({ ...current, summaryInstructions: event.target.value }))}/><label className="field-label" htmlFor="transcription-instructions">Gemini Flash transcription preferences</label><textarea id="transcription-instructions" className="prompt-input" maxLength={4000} value={preferences.transcriptionInstructions} placeholder="Example: The lecturer discusses biology. Preserve terms such as mitochondria and ATP. Keep filler words." onChange={(event) => setPreferences((current) => ({ ...current, transcriptionInstructions: event.target.value }))}/><p>Free-form instructions use Gemini Flash. Leave this empty to prefer dedicated speech-to-text in Recommended mode. Accuracy and timestamp rules stay in place.</p><details className="prompt-details"><summary>View transcription request</summary><pre>{transcriptionRequestPreview(modelCandidates(models, "audio", { modelSelection, selectedModel, autoFallback, transcriptionInstructions: preferences.transcriptionInstructions })[0], preferences.transcriptionInstructions, settings.language)}</pre></details><details className="prompt-details"><summary>View summary prompt for this note</summary><pre>{buildGenerationPrompt({ noteId: active.id, noteTitle: active.title, mode: "concise", start: 0, end: latestNoteTime(active), chunks: active.chunks, typedNotes: active.typedNotes, instructions: preferences.summaryInstructions })}</pre></details><button className="secondary-action" onClick={() => setPreferences((current) => ({ ...current, summaryInstructions: "", transcriptionInstructions: "" }))}>Reset custom instructions</button></div>
           </>}
           {settingsSection === "capture" && <>
           <div className="setting-group"><div><strong>Transcript chunk length</strong><p>Larger chunks keep connected ideas together.</p></div><select aria-label="Transcript chunk length" value={settings.chunkSeconds} disabled={recordingState !== "idle"} onChange={(event) => setSettings((current) => ({ ...current, chunkSeconds: Number(event.target.value) }))}><option value={45}>45 seconds</option><option value={60}>60 seconds (recommended)</option><option value={90}>90 seconds</option><option value={120}>2 minutes</option></select></div>
@@ -1175,12 +1193,12 @@ function WorkspaceTab({ tab, note, composer, updateActive, showNotice, summaryMe
   const [selection, setSelection] = useState({ transcript: true, notes: true, draft: true, quick: true, concise: true, study: true, actions: true, timestamps: true, latex: true });
   if (tab === "notes") return <section><div className="section-heading"><div><h2>Typed notes</h2><p>Questions, connections, and things to remember</p></div></div>{note.typedNotes.length ? note.typedNotes.map((item) => <div className="transcript-row" key={item.id}><time>{formatTime(item.time)}</time><textarea rows={3} aria-label={`Typed note at ${formatTime(item.time)}`} value={item.text} onChange={(e) => updateActive((n) => ({ ...n, typedNotes: n.typedNotes.map((x) => x.id === item.id ? { ...x, text: e.target.value } : x) }))}/></div>) : <div className="empty-state compact"><h3>Keep your own perspective</h3><p>Add a question or key idea below. Each thought keeps its place in the lecture.</p></div>}{composer}</section>;
   if (tab === "summaries") return <section>
-    <div className="section-heading"><div><h2>Summaries</h2><p>{aiReady ? `AI notes use ${selectedModel}` : "Connect Gemini to generate real AI notes"}</p></div><div className="summary-actions"><button aria-expanded={summaryMenu} aria-controls="generation-options" className="summary-button" disabled={!aiReady || generationBusy} onClick={() => setSummaryMenu(!summaryMenu)}><Icon name="sparkle" size={16}/> {generation ? "Generating…" : "Generate"}</button>{summaryMenu && <div id="generation-options" className="summary-menu"><button onClick={() => generateSummary("quick")}><strong>Catch Me Up · new only</strong><small>Confirmed chunks since the last successful checkpoint</small></button><button onClick={() => generateSummary("quick", { wholeLecture: true })}><strong>Catch Me Up · whole lecture</strong><small>All confirmed chunks through the moment you press the button</small></button><button onClick={() => generateSummary("concise")}><strong>Concise notes</strong><small>Compact lecture notes with only relevant sections and actions</small></button><button onClick={() => generateSummary("study")}><strong>Detailed study guide</strong><small>Thorough, flexible study notes with Markdown and LaTeX</small></button></div>}</div></div>
+    <div className="section-heading"><div><h2>Summaries</h2><p>{aiReady ? `AI notes use ${selectedModel}` : "Connect Gemini to generate real AI notes"}</p></div><div className="summary-actions"><button aria-expanded={summaryMenu} aria-controls="generation-options" className="summary-button" disabled={!aiReady || generationBusy} onClick={() => setSummaryMenu(!summaryMenu)}><Icon name="sparkle" size={16}/> {generation ? "Generating…" : "Generate"}</button>{summaryMenu && <div id="generation-options" className="summary-menu"><button onClick={() => generateSummary("quick")}><strong>Catch Me Up · new only</strong><small>Confirmed chunks since the last successful checkpoint</small></button><button onClick={() => generateSummary("quick", { wholeLecture: true })}><strong>Catch Me Up · whole lecture</strong><small>All confirmed chunks through the moment you press the button</small></button><button onClick={() => generateSummary("concise")}><strong>Basic · concise notes</strong><small>Compact lecture notes with only relevant sections and actions</small></button><button onClick={() => generateSummary("study")}><strong>Detailed study guide</strong><small>Thorough, flexible study notes with Markdown and LaTeX</small></button></div>}</div></div>
     {!aiReady && <div className="ai-unavailable"><div><strong>AI note generation is off</strong><p>Add your own Google AI Studio key and test the connection. Transcript recording, editing, and export still work normally.</p></div><button onClick={openAISettings}>Open AI settings</button></div>}
     {generation && <div className="generation-state" role="status"><span className="spinner"/><div><strong>{generation.label}</strong><p>The completed source range is fixed while recording continues.</p></div><button onClick={cancelGeneration}>Cancel</button></div>}
     {generationError && <div className="generation-error" role={/cancelled/i.test(generationError) ? "status" : "alert"}><div><strong>{/cancelled/i.test(generationError) ? "Generation cancelled" : "Generation failed"}</strong><p>{generationError}</p>{pendingSource && <small>Pending range: {rangeLabel(pendingSource.start, pendingSource.end)}</small>}</div><button disabled={!aiReady || generationBusy} onClick={retryGeneration}>Retry</button></div>}
     {note.summaries.length ? <div className="summary-list">{note.summaries.map((summary) => <article className="summary-block" key={summary.id}>
-      <header><div className="summary-meta"><div><span className={`summary-kind ${summary.kind}`}>{summary.kind === "quick" ? "Catch Me Up" : summary.kind === "concise" ? "Concise Notes" : summary.kind === "study" ? "Study Guide" : "Action Items"}</span><time>Generated from {rangeLabel(summary.start, summary.end)}</time></div><small>{summary.provider && summary.model ? `${summary.provider} · ${summary.model} · ${new Date(summary.createdAt).toLocaleString()}` : new Date(summary.createdAt).toLocaleString()}{summary.usedMultiStage ? " · multi-stage" : ""}{summary.regeneratedFrom ? " · regenerated version" : ""}</small></div><div className="summary-block-actions">{summary.kind !== "actions" && <button disabled={!aiReady || generationBusy} title={`Uses the currently selected model: ${selectedModel || "none"}`} onClick={() => generateSummary(summary.kind as GenerationMode, { regenerate: summary })}>Regenerate</button>}<button onClick={() => setEditing(editing === summary.id ? null : summary.id)}>{editing === summary.id ? "Preview" : "Edit source"}</button></div></header>
+      <header><div className="summary-meta"><div><span className={`summary-kind ${summary.kind}`}>{summary.kind === "quick" ? "Catch Me Up" : summary.kind === "concise" ? "Concise Notes" : summary.kind === "study" ? "Study Guide" : "Action Items"}</span><time>Generated from {rangeLabel(summary.start, summary.end)}</time></div><small>{summary.provider && summary.model ? `${summary.provider} · ${summary.model} · ${new Date(summary.createdAt).toLocaleString()}` : new Date(summary.createdAt).toLocaleString()}{summary.fallbackFrom?.length ? ` · fallback from ${summary.fallbackFrom.join(" → ")}` : ""}{summary.usedMultiStage ? " · multi-stage" : ""}{summary.regeneratedFrom ? " · regenerated version" : ""}</small></div><div className="summary-block-actions">{summary.kind !== "actions" && <button disabled={!aiReady || generationBusy} title={`Uses the currently selected model: ${selectedModel || "none"}`} onClick={() => generateSummary(summary.kind as GenerationMode, { regenerate: summary })}>Regenerate</button>}<button onClick={() => setEditing(editing === summary.id ? null : summary.id)}>{editing === summary.id ? "Preview" : "Edit source"}</button></div></header>
       {editing === summary.id
         ? <textarea aria-label="Edit summary source" className="summary-source" value={summary.source} onChange={(e) => updateActive((n) => ({ ...n, summaries: n.summaries.map((item) => item.id === summary.id ? { ...item, source: e.target.value } : item) }))}/>
         : <Suspense fallback={<p className="summary-loading" role="status">Opening summary…</p>}><SummaryPreview source={summary.source}/></Suspense>

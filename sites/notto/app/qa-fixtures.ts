@@ -26,7 +26,7 @@ export function qaFixtures() {
     async listModels(key, signal) {
       if (signal?.aborted) throw new ProviderError("cancelled", "Cancelled.");
       if (key === "bad-key") throw new ProviderError("invalid_key", "Gemini rejected this API key. Check the key in Google AI Studio and try again.");
-      return [{ name: "qa-gemini-fixture", displayName: "Gemini UI test fixture", description: "Simulated response, development only", inputTokenLimit: 1000000, outputTokenLimit: 8000, preview: false }];
+      return [{ name: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash (QA fixture)", description: "Simulated response, development only", inputTokenLimit: 1000000, outputTokenLimit: 8000, preview: false }];
     },
     async generate(key, _model, snapshot, signal, progress) {
       progress?.("Checking source size…");

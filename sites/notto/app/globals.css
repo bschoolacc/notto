@@ -136,6 +136,14 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline:2px 
 .import-button.disabled { opacity:.5; cursor:not-allowed; }
 .summary-menu { max-width:calc(100vw - 32px); }
 .settings-panel { overscroll-behavior:contain; padding-bottom:max(27px, env(safe-area-inset-bottom)); }
+.model-recommendations { display:grid; gap:12px; margin:0; padding:14px; border:1px solid var(--line); border-radius:10px; background:var(--paper-2); }
+.model-recommendations>div { display:grid; gap:3px; min-width:0; }
+.model-recommendations dt { color:var(--muted); font-size:12px; }
+.model-recommendations dd { margin:0; color:var(--ink); font-size:14px; line-height:1.5; overflow-wrap:anywhere; }
+.model-fallbacks summary { min-height:44px; display:flex; align-items:center; cursor:pointer; color:var(--brown); font-size:14px; font-weight:600; }
+.model-fallbacks summary::before { content:"+"; margin-right:8px; }
+.model-fallbacks[open] summary::before { content:"−"; }
+.model-fallbacks a { color:var(--brown); }
 .sidebar-bottom p, .document-meta { min-height:18px; }
 .toast { bottom:100px; overflow-wrap:anywhere; max-width:min(410px, calc(100vw - 32px)); }
 .toast.empty { padding:0; box-shadow:none; background:transparent; }

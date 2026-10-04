@@ -23,6 +23,8 @@ export type ProviderModel = {
   preview: boolean;
 };
 
+export function isTranscriptionModel(model: Pick<ProviderModel, "name">) { return model.name === "gemini-3.5-transcribe"; }
+
 export type GenerationResult = {
   source: string;
   usedMultiStage: boolean;
@@ -42,6 +44,8 @@ export type ProviderErrorCode =
   | "unavailable_model"
   | "quota"
   | "rate_limit"
+  | "spend_limit"
+  | "temporary_unavailable"
   | "context_too_large"
   | "network"
   | "provider"
@@ -106,6 +110,7 @@ function isPreview(model: Pick<ProviderModel, "name" | "displayName">) {
 
 function suitableModel(raw: { name?: string; displayName?: string; description?: string; supportedGenerationMethods?: string[]; inputTokenLimit?: number; outputTokenLimit?: number }): ProviderModel | null {
   if (!raw.name || !raw.supportedGenerationMethods?.includes("generateContent")) return null;
+  if (raw.name.replace(/^models\//, "") === "gemini-3.5-transcribe") return { name: "gemini-3.5-transcribe", displayName: raw.displayName || "Gemini 3.5 Transcribe", description: raw.description || "Dedicated speech-to-text model", inputTokenLimit: raw.inputTokenLimit, outputTokenLimit: raw.outputTokenLimit, preview: false };
   const searchable = `${raw.name} ${raw.displayName ?? ""} ${raw.description ?? ""}`;
   if (/imagen|image generation|embedding|embed-|text-embedding|aqa|tts|speech generation|live api|robotics/i.test(searchable)) return null;
   if ((raw.inputTokenLimit ?? 0) < 16000) return null;
@@ -150,13 +155,14 @@ function mappedError(status: number, providerMessage: string): ProviderError {
     return new ProviderError("unavailable_model", "The selected Gemini model is no longer available for text generation. Refresh models and choose another one.");
   }
   if (status === 429) {
-    if (/daily|per day|rpd|quota.*exceed|free[_ -]?tier/.test(lower)) return new ProviderError("quota", "The Gemini quota for this project appears to be exhausted. Check usage in AI Studio or try again after the quota resets.");
+    if (/spend|billing|budget|payment|credit|balance/.test(lower)) return new ProviderError("spend_limit", "Google reports a billing or spending limit. Check the project's billing settings; Notto will not switch models for this error.");
+    if (/daily|per day|rpd|quota.*exceed|free[_ -]?tier/.test(lower)) return new ProviderError("quota", "Google reports a usage limit for this request. Check this model's usage in AI Studio or retry after the limit resets.");
     return new ProviderError("rate_limit", "Gemini is rate-limiting this project. Wait a moment, then retry.");
   }
-  if (status === 400 && /token|context|too long|input size/.test(lower)) {
+  if (status === 400 && /input.*(?:token|size|too long)|(?:context|token).*(?:limit|exceed|too large|too long)|too many input tokens|exceeds.*(?:context|token)/.test(lower)) {
     return new ProviderError("context_too_large", "This source is larger than the selected model can safely process. Choose a model with a larger context window.");
   }
-  if (status >= 500) return new ProviderError("provider", "Gemini is temporarily unavailable. Your transcript is safe; retry in a moment.");
+  if (status >= 500) return new ProviderError("temporary_unavailable", "Gemini is temporarily unavailable. Your transcript is safe; retry in a moment.");
   return new ProviderError("provider", "Gemini could not complete this request. Refresh the model list and try again.");
 }
 
@@ -234,9 +240,15 @@ function responseText(payload: { candidates?: Array<{ content?: { parts?: Array<
   return payload.candidates?.[0]?.content?.parts?.filter((part) => !part.thought).map((part) => part.text ?? "").join("\n").trim() ?? "";
 }
 
+export function requestThinkingConfig(model: ProviderModel, mode: GenerationMode | "audio") {
+  if (/^gemma-4-(?:31b|26b-a4b)-it$/.test(model.name) && mode === "quick") return { thinkingConfig: { thinkingLevel: "minimal" } };
+  if (/^gemini-3\.[78]-flash$/.test(model.name)) return { thinkingConfig: { thinkingLevel: mode === "quick" || mode === "audio" ? "low" : "medium" } };
+  return {};
+}
+
 function generationConfig(mode: GenerationMode, model: ProviderModel) {
   const desired = mode === "quick" ? 2400 : mode === "concise" ? 4800 : 8000;
-  return { temperature: 0.25, maxOutputTokens: Math.max(1024, Math.min(desired, model.outputTokenLimit ?? desired)) };
+  return { temperature: model.name.startsWith("gemini-3") ? 1 : 0.25, maxOutputTokens: Math.max(1024, Math.min(desired, model.outputTokenLimit ?? desired)), ...requestThinkingConfig(model, mode) };
 }
 
 async function generateText(apiKey: string, model: ProviderModel, prompt: string, mode: GenerationMode, signal?: AbortSignal) {
@@ -276,7 +288,7 @@ function estimatedTokens(text: string) {
 async function measuredTokens(apiKey: string, model: ProviderModel, text: string, signal?: AbortSignal) {
   try { return await countTokens(apiKey, model, text, signal); }
   catch (error) {
-    if (error instanceof ProviderError && ["cancelled", "invalid_key", "unavailable_model", "quota", "rate_limit", "network"].includes(error.code)) throw error;
+    if (error instanceof ProviderError && ["cancelled", "missing_key", "invalid_key", "unavailable_model", "quota", "rate_limit", "spend_limit", "network", "temporary_unavailable"].includes(error.code)) throw error;
     return estimatedTokens(text);
   }
 }
@@ -336,6 +348,7 @@ async function splitAtChunkBoundaries(apiKey: string, model: ProviderModel, snap
 }
 
 export async function generateWithGemini(apiKey: string, model: ProviderModel, snapshot: SourceSnapshot, signal?: AbortSignal, onProgress?: (message: string) => void): Promise<GenerationResult> {
+  if (isTranscriptionModel(model)) throw new ProviderError("unavailable_model", "This dedicated speech-to-text model cannot write notes. Choose Recommended or a text model.");
   const prompt = buildGenerationPrompt(snapshot);
   onProgress?.("Checking source size…");
   const inputTokens = await measuredTokens(apiKey, model, prompt, signal);

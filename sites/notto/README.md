@@ -19,8 +19,8 @@ Notto is a browser-first personal lecture notetaker. It records microphone audio
 1. Open [Google AI Studio’s API key page](https://aistudio.google.com/apikey), sign in, and create or select a key for a Google project.
 2. In Notto, open **Settings → AI** and paste the key.
 3. Leave **Save key on this device** off for session-only use, or enable it to keep the key in this browser’s local storage.
-4. Press **Test Connection**. Notto calls Gemini’s live Models API and lists only suitable text-generation models available to that key.
-5. Choose a model. Notto prefers a stable Gemini Flash model with a large context window when one is available; preview or experimental models are labeled.
+4. Press **Test Connection**. Notto calls Gemini’s live Models API and lists compatible note and saved-audio transcription models available to that key.
+5. Leave **Recommended** selected for task-specific defaults, or choose a model manually. Notto prefers Gemini 3.8 Flash for Basic/concise notes and study guides, Gemma 4 31B for short Catch Me Up checkpoints, and Gemini 3.5 Transcribe for saved audio when available. Long checkpoints use the Basic model. Free-form transcription preferences use Gemini Flash because the dedicated speech-to-text endpoint does not accept arbitrary prompts. Existing saved model choices remain manual; select Recommended to enable the new defaults.
 
 The key is not present in source code, logs, notes, or exports. It is sent only to Google’s Gemini API in the `x-goog-api-key` request header. Browser storage is accessible to code running in the app, so a saved key is appropriate only for a trusted personal installation. Use **Clear API Key** to remove it.
 
@@ -69,3 +69,17 @@ Install dependencies, run `npm run dev`, and open the local URL. Run `npm run li
 ## Development verification
 
 Use Node 22.13+ and npm. Install dependencies with `npm ci`, then run `npm run lint`, `npx tsc --noEmit`, `npm run build`, `npm run validate:artifact`, and `node --experimental-strip-types --test tests/*.test.mjs`. `/qa` provides isolated responsive and error scenarios only in development and returns 404 in production.
+
+## Recommended models and bounded fallbacks
+
+- Basic/study: `gemini-3.8-flash` → `gemini-3.7-flash` → `gemini-3.1-flash-lite`.
+- Short Catch Me Up: `gemma-4-31b-it` → `gemma-4-26b-a4b-it` → `gemini-3.1-flash-lite`.
+- Saved clips, without free-form preferences: `gemini-3.5-transcribe` → `gemini-3.8-flash` → `gemini-3.7-flash`. With preferences, begin with `gemini-3.8-flash`.
+- Only models returned by the key's Models API are candidates. Missing entries are skipped; documented older compatible Flash models can substitute. At most three distinct models are attempted per operation; normal per-model transient retries still apply.
+- Automatic fallback is optional. Usage/rate limits, model unavailability, transient service failures, and context limits can trigger it. Authentication, spending/billing limits, ambiguous network failures, invalid configurations, cancellation, and incomplete/malformed results stop the operation.
+- The UI announces fallback switches; saved summaries and transcript drafts show the actual model used. A failed request never advances a Catch Me Up checkpoint or creates a summary.
+- Recommendations were chosen from the owner's October 4, 2026 quota screenshots and Google's model documentation. They are not universal quotas or a remaining-usage meter. Gemma's 16K input TPM in those screenshots is a rate limit, not its 256K context window; a conservative 12KB complete-prompt threshold keeps automatic Gemma requests short.
+- The dedicated saved-clip adapter uses native word annotations, validates provider timestamps, and groups words into editable segments. It does not invent timestamps or use a note-writing prompt. Existing 12MB/20-minute limits remain.
+- Live recording still uses browser speech or audio-only capture. Gemini Live is a separate WebSocket/PCM integration and is not implemented in this release. For a future speech-only integration, `gemini-3.5-transcribe-live` is more appropriate than the conversational `gemini-3.8-live`; ten-minute transcription sessions require renewal.
+
+Live provider accuracy and quota availability have not been verified with a user's API key. Automated tests use real-shaped mocked API responses; physical-phone and new-settings screenshot QA require browser/device verification.
